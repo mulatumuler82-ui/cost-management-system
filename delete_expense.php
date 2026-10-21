@@ -1,24 +1,30 @@
 <?php
-session_start();
 require_once 'db.php';
+require_login();
 
-// Redirect to login if user is not authenticated
-if (!isset($_SESSION['user_id'])) {
-    header("Location: index.php");
-    exit();
+if ($_SERVER['REQUEST_METHOD'] !== 'POST' || !csrf_check($_POST['csrf_token'] ?? '')) {
+    flash('error', 'Invalid request.');
+    header('Location: dashboard.php');
+    exit;
 }
 
-// Check if an expense ID was passed in the URL
-if (isset($_GET['id'])) {
-    $expense_id = $_GET['id'];
-    $user_id = $_SESSION['user_id'];
+$id  = (int)($_POST['id'] ?? 0);
+$uid = (int)$_SESSION['user_id'];
 
-    // Delete the expense only if it belongs to the logged-in user (security check)
-    $stmt = $pdo->prepare("DELETE FROM expenses WHERE id = ? AND user_id = ?");
-    $stmt->execute([$expense_id, $user_id]);
+$stmt = $conn->prepare('DELETE FROM transactions WHERE id = ? AND user_id = ?');
+$stmt->bind_param('ii', $id, $uid);
+$stmt->execute();
+
+if ($stmt->affected_rows > 0) {
+    flash('success', 'Record deleted.');
+} else {
+    flash('error', 'Record not found.');
 }
+$stmt->close();
 
-// Redirect back to the dashboard
-header("Location: dashboard.php");
-exit();
-?>
+$back = 'dashboard.php';
+if (!empty($_POST['period']) && in_array($_POST['period'], ['day', 'week', 'month', 'year', 'all'], true)) {
+    $back .= '?period=' . $_POST['period'];
+}
+header('Location: ' . $back);
+exit;
