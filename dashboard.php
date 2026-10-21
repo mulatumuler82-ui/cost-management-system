@@ -1,175 +1,234 @@
 <?php
-session_start();
 require_once 'db.php';
+require_login();
 
-// Redirect to login if user is not authenticated
-if (!isset($_SESSION['user_id'])) {
-    header("Location: index.php");
-    exit();
+$uid = (int)$_SESSION['user_id'];
+
+// ---------- Period ranges ----------
+$today = date('Y-m-d');
+$ranges = [
+    'day'   => [$today, $today, 'Today'],
+    'week'  => [date('Y-m-d', strtotime('monday this week')), date('Y-m-d', strtotime('sunday this week')), 'This Week'],
+    'month' => [date('Y-m-01'), date('Y-m-t'), 'This Month'],
+    'year'  => [date('Y-01-01'), date('Y-12-31'), 'This Year'],
+    'all'   => ['1970-01-01', '2999-12-31', 'All Time'],
+];
+
+$period = $_GET['period'] ?? 'month';
+if (!isset($ranges[$period])) {
+    $period = 'month';
 }
 
-$user_id = $_SESSION['user_id'];
-$username = $_SESSION['username'];
-$error = '';
-$success = '';
-
-// Handle Adding Expense
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_expense'])) {
-    $title = trim($_POST['title']);
-    $amount = trim($_POST['amount']);
-    $category = trim($_POST['category']);
-    $expense_date = trim($_POST['expense_date']);
-
-    if (!empty($title) && !empty($amount) && !empty($category) && !empty($expense_date)) {
-        if (is_numeric($amount) && $amount > 0) {
-            $stmt = $pdo->prepare("INSERT INTO expenses (user_id, title, amount, category, expense_date) VALUES (?, ?, ?, ?, ?)");
-            if ($stmt->execute([$user_id, $title, $amount, $category, $expense_date])) {
-                $success = "Expense added successfully!";
-            } else {
-                $error = "Failed to add expense.";
-            }
-        } else {
-            $error = "Please enter a valid amount.";
-        }
-    } else {
-        $error = "Please fill in all fields.";
-    }
+function sums($conn, $uid, $from, $to) {
+    $stmt = $conn->prepare("SELECT
+            COALESCE(SUM(CASE WHEN type='income'  THEN amount END),0) AS income,
+            COALESCE(SUM(CASE WHEN type='expense' THEN amount END),0) AS expense
+        FROM transactions WHERE user_id = ? AND trans_date BETWEEN ? AND ?");
+    $stmt->bind_param('iss', $uid, $from, $to);
+    $stmt->execute();
+    $r = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    return ['income' => (float)$r['income'], 'expense' => (float)$r['expense'], 'balance' => (float)$r['income'] - (float)$r['expense']];
 }
 
-// Handle Deleting Expense
-if (isset($_GET['delete'])) {
-    $expense_id = $_GET['delete'];
-    $stmt = $pdo->prepare("DELETE FROM expenses WHERE id = ? AND user_id = ?");
-    $stmt->execute([$expense_id, $user_id]);
-    header("Location: dashboard.php");
-    exit();
+$summary = [];
+foreach ($ranges as $key => [$from, $to, $label]) {
+    $summary[$key] = sums($conn, $uid, $from, $to);
 }
 
-// Fetch total spending
-$stmtTotal = $pdo->prepare("SELECT SUM(amount) AS total FROM expenses WHERE user_id = ?");
-$stmtTotal->execute([$user_id]);
-$totalRow = $stmtTotal->fetch();
-$totalSpending = $totalRow['total'] ? $totalRow['total'] : 0.00;
+[$from, $to, $periodLabel] = $ranges[$period];
 
-// Fetch all expenses for this user
-$stmtExpenses = $pdo->prepare("SELECT * FROM expenses WHERE user_id = ? ORDER BY expense_date DESC");
-$stmtExpenses->execute([$user_id]);
-$expenses = $stmtExpenses->fetchAll();
+// ---------- Transactions in selected period ----------
+$stmt = $conn->prepare('SELECT id, type, amount, category, note, trans_date
+    FROM transactions WHERE user_id = ? AND trans_date BETWEEN ? AND ?
+    ORDER BY trans_date DESC, id DESC LIMIT 300');
+$stmt->bind_param('iss', $uid, $from, $to);
+$stmt->execute();
+$rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$stmt->close();
+
+// ---------- Expense by category ----------
+$stmt = $conn->prepare("SELECT category, SUM(amount) AS total
+    FROM transactions WHERE user_id = ? AND type='expense' AND trans_date BETWEEN ? AND ?
+    GROUP BY category ORDER BY total DESC");
+$stmt->bind_param('iss', $uid, $from, $to);
+$stmt->execute();
+$cats = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$stmt->close();
+$catTotal = array_sum(array_column($cats, 'total'));
+
+// ---------- Last 7 days chart data ----------
+$stmt = $conn->prepare("SELECT trans_date, SUM(amount) AS total FROM transactions
+    WHERE user_id = ? AND type='expense' AND trans_date >= DATE_SUB(?, INTERVAL 6 DAY)
+    GROUP BY trans_date");
+$stmt->bind_param('is', $uid, $today);
+$stmt->execute();
+$byDay = [];
+foreach ($stmt->get_result()->fetch_all(MYSQLI_ASSOC) as $r) {
+    $byDay[$r['trans_date']] = (float)$r['total'];
+}
+$stmt->close();
+$last7 = [];
+for ($i = 6; $i >= 0; $i--) {
+    $d = date('Y-m-d', strtotime("-$i day"));
+    $last7[] = ['label' => date('D', strtotime($d)), 'total' => $byDay[$d] ?? 0];
+}
+$max7 = max(1, max(array_column($last7, 'total')));
+
+$success = flash('success');
+$error   = flash('error');
+$token   = csrf_token();
+$sel     = $summary[$period];
+$categories = ['Food', 'Transport', 'Books & School', 'Clothes', 'Health', 'Entertainment', 'Airtime & Internet', 'Other'];
+$incomeCats = ['Allowance', 'Family Support', 'Salary', 'Gift', 'Other'];
 ?>
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard - Cost Management System</title>
-    <!-- Bootstrap 5 CSS -->
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Dashboard - Expense Tracker</title>
+    <link rel="stylesheet" href="assets/style.css">
 </head>
-<body class="bg-light">
-
-    <!-- Navbar -->
-    <nav class="navbar navbar-expand-lg navbar-dark bg-primary shadow-sm">
-        <div class="container">
-            <a class="navbar-brand fw-bold" href="#">Cost Manager</a>
-            <div class="d-flex align-items-center">
-                <span class="text-white me-3">Welcome, <?= htmlspecialchars($username) ?></span>
-                <a href="logout.php" class="btn btn-outline-light btn-sm">Logout</a>
-            </div>
-        </div>
-    </nav>
-
-    <div class="container my-5">
-
-        <!-- Alerts -->
-        <?php if (!empty($error)): ?>
-            <div class="alert alert-danger"><?= htmlspecialchars($error) ?></div>
-        <?php endif; ?>
-        <?php if (!empty($success)): ?>
-            <div class="alert alert-success"><?= htmlspecialchars($success) ?></div>
-        <?php endif; ?>
-
-        <div class="row g-4">
-            <!-- Left Column: Add Expense Form & Summary -->
-            <div class="col-md-4">
-                <!-- Total Spending Card -->
-                <div class="card shadow-sm border-0 rounded-4 p-3 mb-4 bg-white">
-                    <h6 class="text-muted text-uppercase fw-semibold mb-1">Total Spending</h6>
-                    <h3 class="fw-bold text-primary mb-0">$<?= number_format($totalSpending, 2) ?></h3>
-                </div>
-
-                <!-- Add Expense Form -->
-                <div class="card shadow-sm border-0 rounded-4 p-4 bg-white">
-                    <h4 class="fw-bold mb-3">Add New Expense</h4>
-                    <form action="dashboard.php" method="POST">
-                        <div class="mb-3">
-                            <label for="title" class="form-label">Expense Title</label>
-                            <input type="text" class="form-control" id="title" name="title" placeholder="e.g., Grocery shopping" required>
-                        </div>
-                        <div class="mb-3">
-                            <label for="amount" class="form-label">Amount ($)</label>
-                            <input type="number" step="0.01" class="form-control" id="amount" name="amount" placeholder="0.00" required>
-                        </div>
-                        <div class="mb-3">
-                            <label for="category" class="form-label">Category</label>
-                            <select class="form-select" id="category" name="category" required>
-                                <option value="" selected disabled>Choose category...</option>
-                                <option value="Food">Food</option>
-                                <option value="Transport">Transport</option>
-                                <option value="Utilities">Utilities</option>
-                                <option value="Entertainment">Entertainment</option>
-                                <option value="Other">Other</option>
-                            </select>
-                        </div>
-                        <div class="mb-3">
-                            <label for="expense_date" class="form-label">Date</label>
-                            <input type="date" class="form-control" id="expense_date" name="expense_date" required>
-                        </div>
-                        <button type="submit" name="add_expense" class="btn btn-primary w-100 py-2 fw-semibold">Add Expense</button>
-                    </form>
-                </div>
-            </div>
-
-            <!-- Right Column: Expense History Table -->
-            <div class="col-md-8">
-                <div class="card shadow-sm border-0 rounded-4 p-4 bg-white">
-                    <h4 class="fw-bold mb-3">Expense History</h4>
-                    
-                    <?php if (count($expenses) > 0): ?>
-                        <div class="table-responsive">
-                            <table class="table align-middle table-hover">
-                                <thead class="table-light">
-                                    <tr>
-                                        <th>Title</th>
-                                        <th>Category</th>
-                                        <th>Amount</th>
-                                        <th>Date</th>
-                                        <th>Action</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <?php foreach ($expenses as $exp): ?>
-                                        <tr>
-                                            <td class="fw-semibold"><?= htmlspecialchars($exp['title']) ?></td>
-                                            <td><span class="badge bg-secondary"><?= htmlspecialchars($exp['category']) ?></span></td>
-                                            <td class="text-danger fw-bold">$<?= number_format($exp['amount'], 2) ?></td>
-                                            <td><?= htmlspecialchars($exp['expense_date']) ?></td>
-                                            <td>
-                                                <a href="dashboard.php?delete=<?= $exp['id'] ?>" class="btn btn-sm btn-outline-danger" onclick="return confirm('Are you sure you want to delete this expense?');">Delete</a>
-                                            </td>
-                                        </tr>
-                                    <?php endforeach; ?>
-                                </tbody>
-                            </table>
-                        </div>
-                    <?php else: ?>
-                        <p class="text-muted text-center py-4">No expenses recorded yet. Start by adding one using the form!</p>
-                    <?php endif; ?>
-                </div>
-            </div>
-        </div>
-
+<body>
+<header class="topbar">
+    <div class="brand">💰 Expense Tracker</div>
+    <div class="user">
+        Hi, <strong><?= e($_SESSION['username']) ?></strong>
+        <a href="logout.php" class="btn small">Logout</a>
     </div>
+</header>
 
+<main class="container">
+    <?php if ($success): ?><div class="alert success"><?= e($success) ?></div><?php endif; ?>
+    <?php if ($error): ?><div class="alert error"><?= e($error) ?></div><?php endif; ?>
+
+    <!-- Quick overview cards -->
+    <section class="grid four">
+        <?php foreach (['day', 'week', 'month', 'year'] as $k): ?>
+            <a class="card stat <?= $period === $k ? 'active' : '' ?>" href="?period=<?= $k ?>">
+                <div class="muted small"><?= e($ranges[$k][2]) ?></div>
+                <div class="big <?= $summary[$k]['balance'] >= 0 ? 'pos' : 'neg' ?>"><?= money($summary[$k]['balance']) ?></div>
+                <div class="small"><span class="pos">+<?= number_format($summary[$k]['income'], 2) ?></span> /
+                    <span class="neg">-<?= number_format($summary[$k]['expense'], 2) ?></span></div>
+            </a>
+        <?php endforeach; ?>
+    </section>
+
+    <section class="grid two">
+        <!-- Add form -->
+        <div class="card">
+            <h3>Add Record</h3>
+            <form method="POST" action="add_expense.php" id="addForm">
+                <input type="hidden" name="csrf_token" value="<?= e($token) ?>">
+
+                <div class="toggle">
+                    <label><input type="radio" name="type" value="expense" checked> Expense</label>
+                    <label><input type="radio" name="type" value="income"> Income</label>
+                </div>
+
+                <label for="amount">Amount (<?= CURRENCY ?>)</label>
+                <input type="number" id="amount" name="amount" step="0.01" min="0.01" required>
+
+                <label for="category">Category</label>
+                <select id="category" name="category" required></select>
+
+                <label for="trans_date">Date</label>
+                <input type="date" id="trans_date" name="trans_date" value="<?= e($today) ?>" required>
+
+                <label for="note">Note (optional)</label>
+                <input type="text" id="note" name="note" maxlength="255" placeholder="e.g. lunch at cafeteria">
+
+                <button type="submit" class="btn primary block">Save</button>
+            </form>
+        </div>
+
+        <!-- Charts / breakdown -->
+        <div class="card">
+            <h3>Spending – Last 7 Days</h3>
+            <div class="bars">
+                <?php foreach ($last7 as $b): ?>
+                    <div class="bar-col" title="<?= e(money($b['total'])) ?>">
+                        <div class="bar" style="height: <?= round($b['total'] / $max7 * 100) ?>%"></div>
+                        <div class="small muted"><?= e($b['label']) ?></div>
+                    </div>
+                <?php endforeach; ?>
+            </div>
+
+            <h3 style="margin-top:22px">Expenses by Category – <?= e($periodLabel) ?></h3>
+            <?php if (!$cats): ?>
+                <p class="muted">No expenses in this period.</p>
+            <?php else: foreach ($cats as $c): $pct = $catTotal > 0 ? $c['total'] / $catTotal * 100 : 0; ?>
+                <div class="cat-row">
+                    <div class="cat-head"><span><?= e($c['category']) ?></span><span><?= money($c['total']) ?> (<?= round($pct) ?>%)</span></div>
+                    <div class="meter"><div style="width: <?= round($pct) ?>%"></div></div>
+                </div>
+            <?php endforeach; endif; ?>
+        </div>
+    </section>
+
+    <!-- Records -->
+    <section class="card">
+        <div class="row-between">
+            <h3><?= e($periodLabel) ?> – Records</h3>
+            <div class="tabs">
+                <?php foreach ($ranges as $k => $r): ?>
+                    <a href="?period=<?= $k ?>" class="<?= $period === $k ? 'on' : '' ?>"><?= e($k === 'day' ? 'Day' : ($k === 'all' ? 'All' : ucfirst($k))) ?></a>
+                <?php endforeach; ?>
+            </div>
+        </div>
+
+        <div class="grid three small-gap">
+            <div class="mini"><span class="muted small">Income</span><div class="pos"><?= money($sel['income']) ?></div></div>
+            <div class="mini"><span class="muted small">Expense</span><div class="neg"><?= money($sel['expense']) ?></div></div>
+            <div class="mini"><span class="muted small">Balance</span><div class="<?= $sel['balance'] >= 0 ? 'pos' : 'neg' ?>"><?= money($sel['balance']) ?></div></div>
+        </div>
+
+        <?php if (!$rows): ?>
+            <p class="muted">No records yet for this period.</p>
+        <?php else: ?>
+            <div class="table-wrap">
+                <table>
+                    <thead><tr><th>Date</th><th>Type</th><th>Category</th><th>Note</th><th class="right">Amount</th><th></th></tr></thead>
+                    <tbody>
+                    <?php foreach ($rows as $r): ?>
+                        <tr>
+                            <td><?= e($r['trans_date']) ?></td>
+                            <td><span class="badge <?= e($r['type']) ?>"><?= e($r['type']) ?></span></td>
+                            <td><?= e($r['category']) ?></td>
+                            <td><?= e($r['note']) ?></td>
+                            <td class="right <?= $r['type'] === 'income' ? 'pos' : 'neg' ?>">
+                                <?= $r['type'] === 'income' ? '+' : '-' ?><?= number_format($r['amount'], 2) ?>
+                            </td>
+                            <td class="right">
+                                <form method="POST" action="delete_expense.php" onsubmit="return confirm('Delete this record?');">
+                                    <input type="hidden" name="csrf_token" value="<?= e($token) ?>">
+                                    <input type="hidden" name="id" value="<?= (int)$r['id'] ?>">
+                                    <input type="hidden" name="period" value="<?= e($period) ?>">
+                                    <button class="btn small danger" type="submit">Delete</button>
+                                </form>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        <?php endif; ?>
+    </section>
+</main>
+
+<script>
+    const expenseCats = <?= json_encode($categories) ?>;
+    const incomeCats  = <?= json_encode($incomeCats) ?>;
+    const select = document.getElementById('category');
+
+    function fillCategories() {
+        const type = document.querySelector('input[name="type"]:checked').value;
+        const list = type === 'income' ? incomeCats : expenseCats;
+        select.innerHTML = list.map(c => `<option value="${c}">${c}</option>`).join('');
+    }
+    document.querySelectorAll('input[name="type"]').forEach(r => r.addEventListener('change', fillCategories));
+    fillCategories();
+</script>
 </body>
 </html>
