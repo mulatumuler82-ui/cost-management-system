@@ -1,91 +1,101 @@
 <?php
-session_start();
 require_once 'db.php';
 
-$error = '';
-$success = '';
+if (!empty($_SESSION['user_id'])) {
+    header('Location: dashboard.php');
+    exit;
+}
+
+$errors   = [];
+$username = '';
+$email    = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $username = trim($_POST['username']);
-    $email = trim($_POST['email']);
-    $password = trim($_POST['password']);
+    if (!csrf_check($_POST['csrf_token'] ?? '')) {
+        $errors[] = 'Invalid request. Please try again.';
+    }
 
-    if (!empty($username) && !empty($email) && !empty($password)) {
-        // Check if email already exists
-        $stmt = $pdo->prepare("SELECT id FROM users WHERE email = ?");
-        $stmt->execute([$email]);
-        
-        if ($stmt->rowCount() > 0) {
-            $error = "An account with this email already exists.";
-        } else {
-            // Hash the password securely
-            $hashedPassword = password_hash($password, PASSWORD_DEFAULT);
+    $username = trim($_POST['username'] ?? '');
+    $email    = trim($_POST['email'] ?? '');
+    $password = $_POST['password'] ?? '';
+    $confirm  = $_POST['confirm_password'] ?? '';
 
-            // Insert new user
-            $insertStmt = $pdo->prepare("INSERT INTO users (username, email, password) VALUES (?, ?, ?)");
-            if ($insertStmt->execute([$username, $email, $hashedPassword])) {
-                $success = "Registration successful! You can now <a href='index.php'>login</a>.";
-            } else {
-                $error = "Something went wrong. Please try again.";
-            }
+    if (!preg_match('/^[A-Za-z0-9_]{3,30}$/', $username)) {
+        $errors[] = 'Username must be 3-30 characters (letters, numbers, underscore).';
+    }
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $errors[] = 'Please enter a valid email address.';
+    }
+    if (strlen($password) < 8) {
+        $errors[] = 'Password must be at least 8 characters.';
+    }
+    if ($password !== $confirm) {
+        $errors[] = 'Passwords do not match.';
+    }
+
+    if (!$errors) {
+        $stmt = $conn->prepare('SELECT id FROM users WHERE username = ? OR email = ? LIMIT 1');
+        $stmt->bind_param('ss', $username, $email);
+        $stmt->execute();
+        $stmt->store_result();
+        if ($stmt->num_rows > 0) {
+            $errors[] = 'Username or email is already registered.';
         }
-    } else {
-        $error = "Please fill in all fields.";
+        $stmt->close();
+    }
+
+    if (!$errors) {
+        $hash = password_hash($password, PASSWORD_DEFAULT);
+        $stmt = $conn->prepare('INSERT INTO users (username, email, password) VALUES (?, ?, ?)');
+        $stmt->bind_param('sss', $username, $email, $hash);
+        if ($stmt->execute()) {
+            $stmt->close();
+            flash('success', 'Account created! You can now log in.');
+            header('Location: index.php');
+            exit;
+        }
+        $errors[] = 'Something went wrong. Please try again.';
+        $stmt->close();
     }
 }
 ?>
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Register - Cost Management System</title>
-    <!-- Bootstrap 5 CSS -->
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Register - Expense Tracker</title>
+    <link rel="stylesheet" href="assets/style.css">
 </head>
-<body class="bg-light d-flex align-items-center py-5" style="min-height: 100vh;">
+<body class="auth-page">
+    <div class="auth-card">
+        <h2>Create Account</h2>
 
-    <div class="container">
-        <div class="row justify-content-center">
-            <div class="col-md-5">
-                <div class="card shadow-sm border-0 rounded-4 p-4">
-                    <div class="text-center mb-4">
-                        <h2 class="fw-bold text-success">Create Account</h2>
-                        <p class="text-muted">Start managing your personal expenses</p>
-                    </div>
-
-                    <?php if (!empty($error)): ?>
-                        <div class="alert alert-danger" role="alert"><?= htmlspecialchars($error) ?></div>
-                    <?php endif; ?>
-
-                    <?php if (!empty($success)): ?>
-                        <div class="alert alert-success" role="alert"><?= $success ?></div>
-                    <?php endif; ?>
-
-                    <form action="register.php" method="POST">
-                        <div class="mb-3">
-                            <label for="username" class="form-label">Username</label>
-                            <input type="text" class="form-control" id="username" name="username" required>
-                        </div>
-                        <div class="mb-3">
-                            <label for="email" class="form-label">Email Address</label>
-                            <input type="email" class="form-control" id="email" name="email" required>
-                        </div>
-                        <div class="mb-3">
-                            <label for="password" class="form-label">Password</label>
-                            <input type="password" class="form-control" id="password" name="password" required>
-                        </div>
-                        <button type="submit" class="btn btn-success w-100 py-2 fw-semibold">Register</button>
-                    </form>
-
-                    <div class="text-center mt-3">
-                        <p class="text-muted">Already have an account? <a href="index.php" class="text-decoration-none">Login</a></p>
-                    </div>
-                </div>
+        <?php if ($errors): ?>
+            <div class="alert error">
+                <?php foreach ($errors as $err): ?><div><?= e($err) ?></div><?php endforeach; ?>
             </div>
-        </div>
-    </div>
+        <?php endif; ?>
 
+        <form method="POST" action="register.php">
+            <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
+
+            <label for="username">Username</label>
+            <input type="text" id="username" name="username" value="<?= e($username) ?>" required>
+
+            <label for="email">Email</label>
+            <input type="email" id="email" name="email" value="<?= e($email) ?>" required>
+
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" minlength="8" required>
+
+            <label for="confirm_password">Confirm Password</label>
+            <input type="password" id="confirm_password" name="confirm_password" minlength="8" required>
+
+            <button type="submit" class="btn primary block">Register</button>
+        </form>
+
+        <p class="center muted small">Already have an account? <a href="index.php">Log in</a></p>
+    </div>
 </body>
 </html>
