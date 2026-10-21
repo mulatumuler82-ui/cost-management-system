@@ -1,77 +1,71 @@
 <?php
-session_start();
 require_once 'db.php';
 
+if (!empty($_SESSION['user_id'])) {
+    header('Location: dashboard.php');
+    exit;
+}
+
 $error = '';
+$login = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $email = trim($_POST['email']);
-    $password = trim($_POST['password']);
+    $login    = trim($_POST['login'] ?? '');
+    $password = $_POST['password'] ?? '';
 
-    if (!empty($email) && !empty($password)) {
-        // Fetch user from database
-        $stmt = $pdo->prepare("SELECT * FROM users WHERE email = ?");
-        $stmt->execute([$email]);
-        $user = $stmt->fetch();
-
-        // Verify password
-        if ($user && password_verify($password, $user['password'])) {
-            $_SESSION['user_id'] = $user['id'];
-            $_SESSION['username'] = $user['username'];
-            header("Location: dashboard.php");
-            exit();
-        } else {
-            $error = "Invalid email or password.";
-        }
+    if (!csrf_check($_POST['csrf_token'] ?? '')) {
+        $error = 'Invalid request. Please try again.';
+    } elseif ($login === '' || $password === '') {
+        $error = 'Please enter your username/email and password.';
     } else {
-        $error = "Please fill in all fields.";
+        $stmt = $conn->prepare('SELECT id, username, password FROM users WHERE username = ? OR email = ? LIMIT 1');
+        $stmt->bind_param('ss', $login, $login);
+        $stmt->execute();
+        $user = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        if ($user && password_verify($password, $user['password'])) {
+            session_regenerate_id(true);
+            $_SESSION['user_id']  = (int)$user['id'];
+            $_SESSION['username'] = $user['username'];
+            header('Location: dashboard.php');
+            exit;
+        }
+        $error = 'Incorrect username/email or password.';
     }
 }
-?>
 
+$success = flash('success');
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login - Cost Management System</title>
-    <!-- Bootstrap 5 CSS -->
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Login - Expense Tracker</title>
+    <link rel="stylesheet" href="assets/style.css">
 </head>
-<body class="bg-light d-flex align-items-center py-5" style="min-height: 100vh;">
+<body class="auth-page">
+    <div class="auth-card">
+        <h2>💰 Expense Tracker</h2>
+        <p class="muted center">Log in to manage your money</p>
 
-    <div class="container">
-        <div class="row justify-content-center">
-            <div class="col-md-5">
-                <div class="card shadow-sm border-0 rounded-4 p-4">
-                    <div class="text-center mb-4">
-                        <h2 class="fw-bold text-primary">Welcome Back</h2>
-                        <p class="text-muted">Log in to track your expenses</p>
-                    </div>
+        <?php if ($success): ?><div class="alert success"><?= e($success) ?></div><?php endif; ?>
+        <?php if ($error): ?><div class="alert error"><?= e($error) ?></div><?php endif; ?>
 
-                    <?php if (!empty($error)): ?>
-                        <div class="alert alert-danger" role="alert"><?= htmlspecialchars($error) ?></div>
-                    <?php endif; ?>
+        <form method="POST" action="index.php">
+            <input type="hidden" name="csrf_token" value="<?= e(csrf_token()) ?>">
 
-                    <form action="index.php" method="POST">
-                        <div class="mb-3">
-                            <label for="email" class="form-label">Email Address</label>
-                            <input type="email" class="form-control" id="email" name="email" required>
-                        </div>
-                        <div class="mb-3">
-                            <label for="password" class="form-label">Password</label>
-                            <input type="password" class="form-control" id="password" name="password" required>
-                        </div>
-                        <button type="submit" class="btn btn-primary w-100 py-2 fw-semibold">Login</button>
-                    </form>
+            <label for="login">Username or Email</label>
+            <input type="text" id="login" name="login" value="<?= e($login) ?>" required autofocus>
 
-                    <div class="text-center mt-3">
-                        <p class="text-muted">Don't have an account? <a href="register.php" class="text-decoration-none">Sign up</a></p>
-                    </div>
-                </div>
-            </div>
-        </div>
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" required>
+
+            <button type="submit" class="btn primary block">Log In</button>
+        </form>
+
+        <p class="center muted small">No account? <a href="register.php">Register</a></p>
     </div>
-
 </body>
 </html>
